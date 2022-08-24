@@ -14,15 +14,6 @@ export const STORAGE_COST: u128 = u128.from("1000000000000000000000")
 
 const donations = new PersistentVector<Donation>("unique-id-1")
 
-// Beneficiary
-export function set_beneficiary(beneficiary: string): void{
-  storage.set<string>("beneficiary", beneficiary)
-}
-
-export function get_beneficiary(): string{
-  return storage.getPrimitive<string>("beneficiary", "v1.faucet.nonofficial.testnet")
-}
-
 // Donations
 export function add_donation(donor: string, amount: u128): i32 {
   const new_donation: Donation = new Donation(donor, amount)
