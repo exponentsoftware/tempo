@@ -1,6 +1,12 @@
-import { u128, context, logging, ContractPromiseBatch } from "near-sdk-as";
+import { u128, context, logging, ContractPromiseBatch, ContractPromise, PersistentUnorderedMap } from "near-sdk-as";
 import { add_event, Event, EVENT_STORAGE_COST } from "./models/event";
-import { add_program, get_beneficiary, get_program, PROGRAM_STORAGE_COST, redeem_from_balance, set_beneficiary, top_up } from "./models/program";
+import { add_program, get_beneficiary, get_program, ProgramConfig, PROGRAM_STORAGE_COST, redeem_from_balance, set_beneficiary, top_up } from "./models/program";
+
+type Gas = u64;
+const XCC_GAS: Gas = 20_000_000_000_000;
+
+// consider using subaccounts for each program
+// https://github.com/Learn-NEAR/NCD.L1.sample--meme-museum/blob/8c5d025d363f89fdcc7335d58d61a8e3307cd95a/src/museum/assembly/index.ts#L63-L103
 
 // Public - init function, define the beneficiary of programs
 export function init(beneficiary: string): void {
@@ -20,113 +26,147 @@ export function change_beneficiary(beneficiary: string): void {
   set_beneficiary(beneficiary);
 }
 
-export function process_events(  
-  id: string, 
-  event_subevent: string, 
-  program_id: string, 
-  amount: u128, 
+export function process_events(
+  id: string,
+  event_subevent: string,
+  program_id: string,
   learner_id: string
 ): void {
   // only contract deployer can call
   assert(context.predecessor == context.contractName, "Method process_events is private");
-  const total_amount = u128.add(EVENT_STORAGE_COST, amount)
-  // assert enough money was attached to at least event process (reward + storage)
-  assert(context.attachedDeposit > total_amount , `Attach at least ${total_amount}`)
   
+  const prgm = get_program(program_id)!;
+  const event_config = prgm.config.get(event_subevent)!;
+  
+  const total_amount = u128.add(EVENT_STORAGE_COST, event_config.amount)
+  // assert enough money was attached to at least event process (reward + storage)
+  assert(context.attachedDeposit > total_amount, `Attach at least ${total_amount}`)
+
+  assert(u128.gt(event_config.limit, u128.from(0)), `limit is exceeded ${total_amount}`)
+  
+
   // subtract amount from balance
   redeem_from_balance(program_id, total_amount)
-  
+
   // transfer amount to learner
   const beneficiary: string = learner_id;
   ContractPromiseBatch.create(beneficiary).transfer(amount)
   
+  // decrease the limit
+  
+
   // add event metadata on-chain
-  add_event(id, event_subevent, program_id, amount, learner_id)
+  add_event(id, event_subevent, program_id, '' learner_id)
 }
 
-// Public - withdraw all balance from contract to creator
+// Public - initialize program
 export function init_program(
   program_id: string,
+  config: PersistentUnorderedMap<string, ProgramConfig>,
 ): void {
   // assert enough money was attached to at least cover the storage
-  assert(context.attachedDeposit > PROGRAM_STORAGE_COST , `Attach at least ${PROGRAM_STORAGE_COST}`)
-  assert(!get_program(program_id), `program_id: ${program_id} already exists`)
-  
-  const creator_id = context.predecessor;
-  
-  add_program(program_id, creator_id)
+  assert(context.attachedDeposit > PROGRAM_STORAGE_COST, `Attach at least ${PROGRAM_STORAGE_COST}`)
+  assert(get_program(program_id), `program_id: ${program_id} already exists`)
+
+  add_program(program_id, context.predecessor, config);
 }
 
-// Public - withdraw all balance from contract to creator
+// Public - add funds to existing program
 export function top_up_program(
   program_id: string,
-  amount: i32,
+  // amount: i32,
 ): void {
-  const amount_u128 = u128.from(amount);
+  // const amount_u128 = u128.from(amount);
   // assert enough money was attached to at least cover the storage
-  assert(context.attachedDeposit > amount_u128 , `Attach at least ${amount_u128}`)
-  
+  // assert(context.attachedDeposit > amount_u128, `Attach at least ${amount_u128}`)
+  const attached_deposit = context.attachedDeposit
+  assert(attached_deposit > u128.from(1), `Attach at least 1 N`)
+
   // anyone can top up any program
-  
+
   // transfer amount to learner
-  const beneficiary: string = get_beneficiary();
-  ContractPromiseBatch.create(beneficiary).transfer(amount_u128)
-  
+  // const beneficiary: string = get_beneficiary();
+  // ContractPromiseBatch.create(beneficiary).transfer(amount_u128)
+
   // increment balance
-  top_up(program_id, amount_u128);
+  top_up(program_id, attached_deposit);
 }
 
 // Public - withdraw all balance from contract to creator
 export function withdraw_program(
-    program_id: string,
-): void {
-  const program = assert(get_program(program_id), `program_id: ${program_id} does not exist`)
-  
+  program_id: string,
+): boolean {
+  const program = get_program(program_id);
+
   // only creator can withdraw
-  assert(program.creator === context.predecessor, `Only program creator can withdraw`)
-  
+  assert(program && program.creator === context.predecessor, `Only program creator can withdraw`)
+
   // transfer amount to the creator
   // TODO: verify
-  ContractPromiseBatch.create(program.creator).transfer(program.balance)
-  
-  redeem_from_balance(program_id, program.balance);
+  if (program) {
+    // assert that there are no pending payouts for people that have triggered rewardable events
+    // for this program
+    const pending = false // would be set by checking the above statement
+    if (pending) {
+      return false
+    } else {
+      // execute refund
+
+      // begin the transfer
+      ContractPromiseBatch.create(program.creator).transfer(program.balance)
+
+
+      const to_creator = ContractPromiseBatch.create(program.creator);
+      const self = context.contractName
+
+      // refund balance to creator
+      to_creator.transfer(program.balance);
+
+      // receive confirmation of payout before setting game to inactive
+      // read more about cross contract calls (xcc)
+      // https://github.com/near-examples/cross-contract-calls/tree/main/contracts/00.orientation
+      to_creator.then(self).function_call("on_refund_complete", "{}", u128.Zero, XCC_GAS);
+    }
+
+    return true
+  } else {
+    return false
+  }
 }
 
-// // Public - donate
-// export function donate(): i32 {
-//   // assert enough money was attached to at least cover the storage
-//   assert(context.attachedDeposit > STORAGE_COST, `Attach at least ${STORAGE_COST}`)
+// dor proper handling of cross-contract call to self -- test outcomes
+// https://github.com/Learn-NEAR/NCD.L1.sample--meme-museum/blob/8c5d025d363f89fdcc7335d58d61a8e3307cd95a/src/museum/assembly/index.ts#L105-L130
+export function on_refund_complete(): void {
+  assert_self()
+  let results = ContractPromise.getResults();
+  let xcc = results[0];
 
-//   // Get who is calling the method, and how much NEAR they attached
-//   const donor: string = context.predecessor;
-//   const amount: u128 = context.attachedDeposit;
+  // Verifying the remote contract call succeeded.
+  // https://nomicon.io/RuntimeSpec/Components/BindingsSpec/PromisesAPI.html?highlight=promise#returns-3
+  switch (xcc.status) {
+    case 0:
+      // promise result is not complete
+      logging.log("refund of *program* to *creator* in the amount of *balance* is PENDING")
+      break;
+    case 1:
+      // promise result is complete and successful
+      logging.log("refund of *program* to *creator* in the amount of *balance* has COMPLETED")
+      // redeem_from_balance(program_id, program.balance);
+      break;
+    case 2:
+      // promise result is complete and failed
+      logging.log("refund of *program* to *creator* in the amount of *balance* has FAILED")
+      break;
 
-//   // Record the donation
-//   const donation_number: i32 = add_donation(donor, amount);
-//   logging.log(`Thank you ${donor}! donation number: ${donation_number}`);
+    default:
+      logging.log("Unexpected value for promise result [" + memeCreated.status.toString() + "]");
+      break;
+  }
+}
 
-//   // Send the money to the beneficiary
-//   const beneficiary: string = get_beneficiary();
-//   ContractPromiseBatch.create(beneficiary).transfer(amount - STORAGE_COST);
 
-//   return donation_number;
-// }
-
-// // Public - get donation by number
-// export function get_donation_by_number(donation_number: i32): Donation {
-//   return get_donation(donation_number);
-// }
-
-// // Public - get total number of donations
-// export function total_number_of_donation(): i32 {
-//   return total_donations();
-// }
-
-// // Public - get a range of donations
-// export function get_donation_list(from: i32, until: i32): Array<Donation> {
-//   let result: Array<Donation> = new Array<Donation>();
-//   for (let i: i32 = from; i <= until; i++) {
-//     result.push(get_donation(i));
-//   }
-//   return result;
-// }
+function assert_self(): void {
+  const caller = context.predecessor
+  const self = context.contractName
+  assert(caller == self, "Only this contract may call itself");
+}
