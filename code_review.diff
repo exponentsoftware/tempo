@@ -1,0 +1,367 @@
+diff --git a/contract/assembly/index.ts b/contract/assembly/index.ts
+index 5a3d14d..e9c0073 100644
+--- a/contract/assembly/index.ts
++++ b/contract/assembly/index.ts
+@@ -1,7 +1,13 @@
+-import { u128, context, logging, ContractPromiseBatch } from "near-sdk-as";
++import { u128, context, logging, ContractPromiseBatch, ContractPromise } from "near-sdk-as";
+ import { add_event, Event, EVENT_STORAGE_COST } from "./models/event";
+ import { add_program, get_beneficiary, get_program, PROGRAM_STORAGE_COST, redeem_from_balance, set_beneficiary, top_up } from "./models/program";
+ 
++type Gas = u64;
++const XCC_GAS: Gas = 20_000_000_000_000;
++
++// consider using subaccounts for each program
++// https://github.com/Learn-NEAR/NCD.L1.sample--meme-museum/blob/8c5d025d363f89fdcc7335d58d61a8e3307cd95a/src/museum/assembly/index.ts#L63-L103
++
+ // Public - init function, define the beneficiary of programs
+ export function init(beneficiary: string): void {
+   // only contract deployer can call
+@@ -20,76 +26,139 @@ export function change_beneficiary(beneficiary: string): void {
+   set_beneficiary(beneficiary);
+ }
+ 
+-export function process_events(  
+-  id: string, 
+-  event_subevent: string, 
+-  program_id: string, 
+-  amount: u128, 
++export function process_events(
++  id: string,
++  event_subevent: string,
++  program_id: string,
++  amount: u128,
+   learner_id: string
+ ): void {
+   // only contract deployer can call
+   assert(context.predecessor == context.contractName, "Method process_events is private");
+   const total_amount = u128.add(EVENT_STORAGE_COST, amount)
+   // assert enough money was attached to at least event process (reward + storage)
+-  assert(context.attachedDeposit > total_amount , `Attach at least ${total_amount}`)
+-  
++  assert(context.attachedDeposit > total_amount, `Attach at least ${total_amount}`)
++
+   // subtract amount from balance
+   redeem_from_balance(program_id, total_amount)
+-  
++
+   // transfer amount to learner
+   const beneficiary: string = learner_id;
+   ContractPromiseBatch.create(beneficiary).transfer(amount)
+-  
++
+   // add event metadata on-chain
+   add_event(id, event_subevent, program_id, amount, learner_id)
+ }
+ 
+-// Public - withdraw all balance from contract to creator
++// Public - initialize program
+ export function init_program(
+   program_id: string,
+ ): void {
+   // assert enough money was attached to at least cover the storage
+-  assert(context.attachedDeposit > PROGRAM_STORAGE_COST , `Attach at least ${PROGRAM_STORAGE_COST}`)
+-  assert(!get_program(program_id), `program_id: ${program_id} already exists`)
+-  
+-  const creator_id = context.predecessor;
+-  
+-  add_program(program_id, creator_id)
++  assert(context.attachedDeposit > PROGRAM_STORAGE_COST, `Attach at least ${PROGRAM_STORAGE_COST}`)
++  assert(get_program(program_id), `program_id: ${program_id} already exists`)
++
++  add_program(program_id, context.predecessor)
+ }
+ 
+-// Public - withdraw all balance from contract to creator
++// Public - add funds to existing program
+ export function top_up_program(
+   program_id: string,
+-  amount: i32,
++  // amount: i32,
+ ): void {
+-  const amount_u128 = u128.from(amount);
++  // const amount_u128 = u128.from(amount);
+   // assert enough money was attached to at least cover the storage
+-  assert(context.attachedDeposit > amount_u128 , `Attach at least ${amount_u128}`)
+-  
++  // assert(context.attachedDeposit > amount_u128, `Attach at least ${amount_u128}`)
++  const attached_deposit = context.attachedDeposit
++  assert(attached_deposit > u128.from(1), `Attach at least 1 N`)
++
+   // anyone can top up any program
+-  
++
+   // transfer amount to learner
+-  const beneficiary: string = get_beneficiary();
+-  ContractPromiseBatch.create(beneficiary).transfer(amount_u128)
+-  
++  // const beneficiary: string = get_beneficiary();
++  // ContractPromiseBatch.create(beneficiary).transfer(amount_u128)
++
+   // increment balance
+-  top_up(program_id, amount_u128);
++  top_up(program_id, attached_deposit);
+ }
+ 
+ // Public - withdraw all balance from contract to creator
+ export function withdraw_program(
+-    program_id: string,
+-): void {
+-  const program = assert(get_program(program_id), `program_id: ${program_id} does not exist`)
+-  
++  program_id: string,
++): boolean {
++  const program = get_program(program_id);
++
+   // only creator can withdraw
+-  assert(program.creator === context.predecessor, `Only program creator can withdraw`)
+-  
++  assert(program && program.creator === context.predecessor, `Only program creator can withdraw`)
++
+   // transfer amount to the creator
+   // TODO: verify
+-  ContractPromiseBatch.create(program.creator).transfer(program.balance)
+-  
+-  redeem_from_balance(program_id, program.balance);
++  if (program) {
++    // assert that there are no pending payouts for people that have triggered rewardable events
++    // for this program
++    const pending = false // would be set by checking the above statement
++    if (pending) {
++      return false
++    } else {
++      // execute refund
++
++      // begin the transfer
++      ContractPromiseBatch.create(program.creator).transfer(program.balance)
++
++
++      const to_creator = ContractPromiseBatch.create(program.creator);
++      const self = context.contractName
++
++      // refund balance to creator
++      to_creator.transfer(program.balance);
++
++      // receive confirmation of payout before setting game to inactive
++      // read more about cross contract calls (xcc)
++      // https://github.com/near-examples/cross-contract-calls/tree/main/contracts/00.orientation
++      to_creator.then(self).function_call("on_refund_complete", "{}", u128.Zero, XCC_GAS);
++    }
++
++    return true
++  } else {
++    return false
++  }
++}
++
++// dor proper handling of cross-contract call to self -- test outcomes
++// https://github.com/Learn-NEAR/NCD.L1.sample--meme-museum/blob/8c5d025d363f89fdcc7335d58d61a8e3307cd95a/src/museum/assembly/index.ts#L105-L130
++export function on_refund_complete(): void {
++  assert_self()
++  let results = ContractPromise.getResults();
++  let xcc = results[0];
++
++  // Verifying the remote contract call succeeded.
++  // https://nomicon.io/RuntimeSpec/Components/BindingsSpec/PromisesAPI.html?highlight=promise#returns-3
++  switch (xcc.status) {
++    case 0:
++      // promise result is not complete
++      logging.log("refund of *program* to *creator* in the amount of *balance* is PENDING")
++      break;
++    case 1:
++      // promise result is complete and successful
++      logging.log("refund of *program* to *creator* in the amount of *balance* has COMPLETED")
++      // redeem_from_balance(program_id, program.balance);
++      break;
++    case 2:
++      // promise result is complete and failed
++      logging.log("refund of *program* to *creator* in the amount of *balance* has FAILED")
++      break;
++
++    default:
++      logging.log("Unexpected value for promise result [" + memeCreated.status.toString() + "]");
++      break;
++  }
++}
++
++
++function assert_self(): void {
++  const caller = context.predecessor
++  const self = context.contractName
++  assert(caller == self, "Only this contract may call itself");
+ }
+ 
+ // // Public - donate
+@@ -129,4 +198,4 @@ export function withdraw_program(
+ //     result.push(get_donation(i));
+ //   }
+ //   return result;
+-// }
+\ No newline at end of file
++// }
+diff --git a/contract/assembly/model.ts b/contract/assembly/model.ts
+deleted file mode 100644
+index c73db33..0000000
+--- a/contract/assembly/model.ts
++++ /dev/null
+@@ -1,32 +0,0 @@
+-import { storage, u128, PersistentVector, context } from "near-sdk-as";
+-
+-// Class and vector holding donations
+-@nearBindgen
+-export class Donation{
+-  constructor(
+-    public donor: string,
+-    public amount: u128
+-  ) { }
+-}
+-
+-// Aprox. cost (u128 + string = 16b + 64b = 80b = 800000000000000000000yN)
+-export const STORAGE_COST: u128 = u128.from("1000000000000000000000")
+-
+-const donations = new PersistentVector<Donation>("unique-id-1")
+-
+-// Donations
+-export function add_donation(donor: string, amount: u128): i32 {
+-  const new_donation: Donation = new Donation(donor, amount)
+-  donations.push(new_donation)
+-  return donations.length
+-}
+-
+-export function get_donation(donation_number: i32): Donation {
+-  assert(donation_number > 0 &&  donation_number <= donations.length,
+-         "Error: Invalid donation number")
+-  return donations[donation_number - 1]
+-}
+-
+-export function total_donations() : i32{
+-  return donations.length
+-}
+\ No newline at end of file
+diff --git a/contract/assembly/models/event.ts b/contract/assembly/models/event.ts
+index c298f4a..fdd8833 100644
+--- a/contract/assembly/models/event.ts
++++ b/contract/assembly/models/event.ts
+@@ -2,7 +2,7 @@ import { u128, PersistentUnorderedMap } from "near-sdk-as";
+ 
+ // Class and vector holding events
+ @nearBindgen
+-export class Event{
++export class Event {
+   constructor(
+     public id: string,
+     public event_subevent: string,
+@@ -18,10 +18,10 @@ export const EVENT_STORAGE_COST: u128 = u128.from("3000000000000000000000")
+ const events = new PersistentUnorderedMap<string, Event>("events-v1")
+ 
+ export function add_event(
+-  id: string, 
+-  event_subevent: string, 
+-  program_id: string, 
+-  amount: u128, 
++  id: string,
++  event_subevent: string,
++  program_id: string,
++  amount: u128,
+   learner_id: string
+ ): string {
+   const new_event: Event = new Event(id, event_subevent, program_id, amount, learner_id);
+@@ -34,6 +34,6 @@ export function get_event(id: string): Event {
+   return event
+ }
+ 
+-export function total_events() : i32{
++export function total_events(): i32 {
+   return events.length
+-}
+\ No newline at end of file
++}
+diff --git a/contract/assembly/models/program.ts b/contract/assembly/models/program.ts
+index 647d298..eedc7a5 100644
+--- a/contract/assembly/models/program.ts
++++ b/contract/assembly/models/program.ts
+@@ -1,12 +1,14 @@
+ import { storage, u128, PersistentUnorderedMap, logging } from "near-sdk-as";
+ 
++type AccountId = string;
++
+ // Class and vector holding donations
+ @nearBindgen
+-export class Program{
++export class Program {
+   constructor(
+-    public program_id: string, 
+-    public creator: string,
+-    public balance: u128, 
++    public program_id: string,
++    public creator: AccountId,
++    public balance: u128,
+   ) { }
+ }
+ 
+@@ -16,11 +18,11 @@ export const PROGRAM_STORAGE_COST: u128 = u128.from("2000000000000000000000")
+ const programs = new PersistentUnorderedMap<string, Program>("programs-v1")
+ 
+ // Beneficiary
+-export function set_beneficiary(beneficiary: string): void{
++export function set_beneficiary(beneficiary: string): void {
+   storage.set<string>("beneficiary", beneficiary)
+ }
+ 
+-export function get_beneficiary(): string{
++export function get_beneficiary(): string {
+   return storage.getPrimitive<string>("beneficiary", "hivemind.testnet")
+ }
+ 
+@@ -30,36 +32,37 @@ export function add_program(program_id: string, creator: string): i32 {
+   return programs.length
+ }
+ 
+-export function get_program(program_id: string): Program {
+-  const program = assert(programs.get(program_id), `invalid program_id: ${program_id}`)
+-  return program
++export function get_program(program_id: string): Program | null {
++  return programs.get(program_id)
+ }
+ 
+ // increment balance
+ export function top_up(program_id: string, amount: u128): i32 {
+   const program = programs.get(program_id) as Program
+   assert(program, `program_id ${program_id} is not valid`)
+-  
++
+   const balance = program.balance
+   program.balance = u128.add(balance, amount)
+-
++  programs.set(program_id, program) // need to save the program state again or lose it in memory
+   return programs.length
+ }
+ 
+ // decrement balance, incase of processing event or withdraw
+ export function redeem_from_balance(program_id: string, amount: u128): i32 {
+-  const program = programs.get(program_id) as Program
++  const program: Program = programs.get(program_id)!
+   assert(program, `program_id ${program_id} is not valid`)
+ 
++  // assert(u128.eq(amount, program.balance), "cannot subtract amount")
++
+   const balance = program.balance
+   const new_balance = u128.sub(balance, amount)
+-  
++
+   assert(u128.gt(new_balance, u128.from(0)), "Not enough balance to redeem")
+-  
++
+   program.balance = new_balance
+   return programs.length
+ }
+ 
+-export function total_programs() : i32{
++export function total_programs(): i32 {
+   return programs.length
+-}
+\ No newline at end of file
++}
+diff --git a/contract/assembly/utils.ts b/contract/assembly/utils.ts
+deleted file mode 100644
+index e69de29..0000000
